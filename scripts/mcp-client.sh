@@ -22,6 +22,13 @@ resolve_token() {
   printf '%s\n' "$token"
 }
 
+agy_config_is_encrypted() {
+  local config="$HOME/.gemini/config/mcp_config.json"
+  [[ -f "$config" ]] && python3 -c \
+    'import sys; sys.exit(open(sys.argv[1], "rb").read(10) != b"\0GITCRYPT\0")' \
+    "$config"
+}
+
 _mcp_client_bin() {
   case "$1" in
     claude) printf '%s\n' "${CLAUDE:-claude}" ;;
@@ -156,6 +163,10 @@ _mcp_client_register() {
     echo "$title CLI not found — skipping $title registration."
     echo "After installing $(_mcp_client_install_name "$client"), run 'make use-${transport}-${client}'."
     return 0
+  fi
+  if [[ "$client" == agy ]] && agy_config_is_encrypted; then
+    echo "AGY config $HOME/.gemini/config/mcp_config.json is Git-crypt encrypted; run 'git -C \"\$HOME/.gemini\" crypt unlock', then 'make use-${transport}-agy'." >&2
+    return 1
   fi
   echo "Removing existing '$MCP_NAME' $title MCP registration (if any)..."
   _mcp_client_remove "$client" "$bin" "$MCP_NAME"

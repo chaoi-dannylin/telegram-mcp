@@ -169,7 +169,9 @@ check_grok() {
 # agy — stores `${TELEGRAM_MCP_TOKEN}` in mcp_config.json and expands it at
 # load time; its CLI has no probe, so handshake with that token ourselves.
 check_agy() {
-  if ! "$AGY" mcp list 2>/dev/null | grep -qF "$MCP_NAME"; then
+  if agy_config_is_encrypted; then
+    bad "AGY config is Git-crypt encrypted — run 'git -C \"\$HOME/.gemini\" crypt unlock', then 'make use-http-agy'"
+  elif ! "$AGY" mcp list 2>/dev/null | grep -qF "$MCP_NAME"; then
     bad "$MCP_NAME not registered — run 'make use-http-agy'"
   else
     probe_token TELEGRAM_MCP_TOKEN "token from \$TELEGRAM_MCP_TOKEN"

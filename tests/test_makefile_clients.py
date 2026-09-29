@@ -1,4 +1,6 @@
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -17,13 +19,15 @@ REGISTER_TARGETS = [
 
 
 def run_make(target: str, **variables: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["make", target, *(f"{key}={value}" for key, value in variables.items())],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory() as home:
+        return subprocess.run(
+            ["make", target, *(f"{key}={value}" for key, value in variables.items())],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "HOME": home},
+        )
 
 
 @pytest.mark.parametrize("target,variable", REGISTER_TARGETS)

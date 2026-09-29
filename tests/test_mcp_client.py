@@ -50,8 +50,8 @@ def test_register_missing_cli_is_skipped_with_follow_up(client, variable):
 
 
 @pytest.mark.parametrize("client,variable", CLIENTS)
-def test_register_failure_is_not_reported_as_success(client, variable):
-    result = run_client("register", client, "http", extra_env={variable: "false"})
+def test_register_failure_is_not_reported_as_success(client, variable, tmp_path):
+    result = run_client("register", client, "http", extra_env={variable: "false", "HOME": str(tmp_path)})
 
     assert result.returncode != 0
     assert "Removing existing" in result.stdout
@@ -71,6 +71,22 @@ def test_copilot_http_header_keeps_token_as_env_reference(tmp_path):
     args = log.read_text().splitlines()
     assert "Authorization: Bearer ${TELEGRAM_MCP_TOKEN}" in args
     assert args[-2:] == ["telegram-mcp", "http://127.0.0.1:8765/mcp"]
+
+
+def test_agy_registration_stops_before_cli_when_config_is_encrypted(tmp_path):
+    config = tmp_path / ".gemini" / "config" / "mcp_config.json"
+    config.parent.mkdir(parents=True)
+    config.write_bytes(b"\x00GITCRYPT\x00encrypted")
+    log = tmp_path / "agy-calls"
+    agy = tmp_path / "agy"
+    agy.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" >> "{log}"\n')
+    agy.chmod(agy.stat().st_mode | stat.S_IEXEC)
+
+    result = run_client("register", "agy", "http", extra_env={"HOME": str(tmp_path), "AGY": str(agy)})
+
+    assert result.returncode != 0
+    assert "Git-crypt encrypted" in result.stderr
+    assert not log.exists()
 
 
 def test_resolve_token_prefers_process_env(tmp_path):
