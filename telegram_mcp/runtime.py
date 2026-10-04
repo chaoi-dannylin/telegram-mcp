@@ -2641,6 +2641,7 @@ _DANGEROUS_TOOLS: frozenset[str] = frozenset(
         "delete_contact",
         "delete_profile_photo",
         "delete_chat_photo",
+        "delete_forum_topic",
         "ban_user",
         "remove_user",
         "promote_admin",

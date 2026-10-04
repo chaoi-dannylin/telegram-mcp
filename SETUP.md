@@ -355,13 +355,13 @@ TELEGRAM_MCP_ALLOWED_ROOTS="~/Downloads/telegram_mcp_files,/absolute/path/to/pro
 
 ### 預設停用的危險工具
 
-以下 **19 個工具**預設停用（對 MCP 客戶端不可見），涵蓋不可逆刪除、權限變更、大量個人資料寫入等高風險操作：
+以下 **21 個工具**預設停用（對 MCP 客戶端不可見），涵蓋不可逆刪除、權限變更、大量個人資料寫入等高風險操作：
 
 | 類別 | 工具 |
 | ---- | ---- |
 | 刪除訊息 | `delete_message`、`delete_messages_bulk`、`delete_scheduled_message`、`delete_chat_history` |
-| 刪除資料 | `delete_folder`、`delete_contact`、`delete_profile_photo`、`delete_chat_photo` |
-| 群組管理 | `ban_user`、`promote_admin`、`demote_admin`、`edit_admin_rights` |
+| 刪除資料 | `delete_folder`、`delete_contact`、`delete_profile_photo`、`delete_chat_photo`、`delete_forum_topic` |
+| 群組管理 | `ban_user`、`remove_user`、`promote_admin`、`demote_admin`、`edit_admin_rights` |
 | 建立群組 | `create_group`、`create_channel` |
 | 資料匯出入 | `export_contacts`、`export_chat_invite`、`import_contacts` |
 | 帳號設定 | `set_privacy_settings`、`leave_chat` |
