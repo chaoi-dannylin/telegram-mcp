@@ -967,6 +967,7 @@ _DEFAULT_EXTENSION_ALLOWLISTS: dict[str, set[str]] = {
     "send_sticker": {".webp"},
     "set_profile_photo": {".jpg", ".jpeg", ".png", ".webp"},
     "edit_chat_photo": {".jpg", ".jpeg", ".png", ".webp"},
+    "export_unread_messages": {".json"},
 }
 # Mutable, TELEGRAM_FILE_EXTENSIONS-aware allowlist actually consulted by
 # _ensure_extension_allowed(). Rebuilt from _DEFAULT_EXTENSION_ALLOWLISTS by

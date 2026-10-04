@@ -2606,6 +2606,7 @@ async def export_unread_messages(
     output_path: str,
     resume: bool = True,
     include_media_metadata: bool = True,
+    ctx: Optional[Context] = None,
     account: str = None,
 ) -> str:
     """Export all unread messages from one or more chats to a JSON file.
@@ -2618,7 +2619,7 @@ async def export_unread_messages(
 
     Args:
         chat_ids: List of chat IDs or usernames to export unread messages from.
-        output_path: Absolute or relative file path to write the JSON export.
+        output_path: Absolute or relative .json path under allowed roots.
             The file contains a JSON object with a top-level "chats" key.
         resume: If True and output_path already exists, skip chats that were
             already exported in a previous run (keyed by chat_id). Default True.
@@ -2631,8 +2632,15 @@ async def export_unread_messages(
     try:
         cl = get_client(account)
 
-        # Resolve output path and load prior state for resume support
-        out = Path(output_path).expanduser()
+        # Fork: confine reads/writes to allowed roots like every other file tool.
+        out, path_error = await _resolve_writable_file_path(
+            raw_path=output_path,
+            default_filename="unread_export.json",
+            ctx=ctx,
+            tool_name="export_unread_messages",
+        )
+        if path_error:
+            return path_error
         prior: dict = {}
         if resume and out.exists():
             try:
@@ -2711,7 +2719,6 @@ async def export_unread_messages(
             stats["messages_exported"] += len(exported_msgs)
 
         # Persist to output file
-        out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w", encoding="utf-8") as fh:
             json.dump(result, fh, indent=2, default=json_serializer, ensure_ascii=False)
 

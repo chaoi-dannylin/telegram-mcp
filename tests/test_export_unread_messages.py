@@ -80,6 +80,11 @@ def _dialog(chat_id, unread_count):
     )
 
 
+@pytest.fixture(autouse=True)
+def _allowed_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "SERVER_ALLOWED_ROOTS", [tmp_path.resolve()])
+
+
 def _patch_export(monkeypatch, client):
     monkeypatch.setattr(runtime, "clients", {"default": client})
     monkeypatch.setattr(messages, "get_client", lambda account=None: client)
@@ -267,3 +272,15 @@ async def test_export_creates_parent_directories(tmp_path, monkeypatch):
     assert str(chat_id) in data["chats"]
     assert summary["status"] == "ok"
     assert summary["output_path"] == str(out.resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["../escape.json", "out.txt"])
+async def test_export_rejects_paths_outside_roots_or_non_json(tmp_path, monkeypatch, name):
+    client = FakeExportClient()
+    _patch_export(monkeypatch, client)
+
+    result = await messages.export_unread_messages(chat_ids=[], output_path=str(tmp_path / name))
+
+    assert not (tmp_path / name).exists()
+    assert "outside allowed roots" in result or "not allowed" in result
