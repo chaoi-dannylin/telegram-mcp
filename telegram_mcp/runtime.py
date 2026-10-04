@@ -10,6 +10,13 @@ import sqlite3
 import logging
 import mimetypes
 import unicodedata
+
+# Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
@@ -19,8 +26,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from mcp.server.fastmcp import FastMCP, Context, Image
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from mcp.types import Annotations, ImageContent, TextContent, ToolAnnotations
 from mcp.shared.exceptions import McpError
 from pythonjsonlogger import jsonlogger
@@ -46,7 +55,6 @@ from telethon.tl.types import (
     DialogFilterDefault,
     TextWithEntities,
 )
-import re
 import hashlib
 import tempfile
 
@@ -238,7 +246,10 @@ def _install_annotation_hook() -> None:
                                 type="text",
                                 text=(
                                     "Telegram MCP tool timed out after "
-                                    f"{timeout:g}s (code: GEN-TIMEOUT)."
+                                    f"{timeout:g}s (code: GEN-TIMEOUT). "
+                                    "Completion is unknown; a write may already have "
+                                    "succeeded. Check destination state before retrying "
+                                    "non-idempotent operations."
                                 ),
                             )
                         ],
@@ -571,8 +582,52 @@ def _get_flood_sleep_threshold() -> int:
         return 60
 
 
+def _resolve_session_path(session_name: str) -> str:
+    """Resolve a relative session name against the project root.
+
+    When TELEGRAM_SESSION_NAME is a relative path/name (e.g. 'my_session' or
+    'sessions/main'), running from a different working directory makes Telethon
+    search os.getcwd() and fail to find the existing .session file, triggering
+    an interactive login prompt.
+    This resolves the relative path against the repository/project root (or the
+    directory where .env was found) if the file exists there, or if running
+    from a subdirectory of the project root.
+    """
+    if not session_name or os.path.isabs(session_name) or session_name == ":memory:":
+        return session_name
+
+    candidate_roots = [PROJECT_ROOT]
+    try:
+        env_file = find_dotenv()
+        if env_file:
+            env_dir = os.path.dirname(os.path.abspath(env_file))
+            if env_dir not in candidate_roots:
+                candidate_roots.append(env_dir)
+    except Exception:
+        pass
+
+    for root in candidate_roots:
+        target = os.path.join(root, session_name)
+        target_session = target if target.endswith(".session") else f"{target}.session"
+        if os.path.exists(target) or os.path.exists(target_session):
+            return target
+
+    # If running from a subdirectory of project root, resolve to project root
+    # so subdirectories don't lose the session file
+    cwd = os.path.abspath(os.getcwd())
+    try:
+        if os.path.commonpath([cwd, PROJECT_ROOT]) == PROJECT_ROOT and cwd != PROJECT_ROOT:
+            return os.path.join(PROJECT_ROOT, session_name)
+    except ValueError:
+        pass
+
+    return session_name
+
+
 def _build_client(session: Any, label: str) -> TelegramClient:
     """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
+    if isinstance(session, str):
+        session = _resolve_session_path(session)
     proxy, connection = _build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
     if proxy is not None:
@@ -687,7 +742,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
             accounts[label] = _build_client(StringSession(value), label)
         elif key.startswith(prefix_name) and value:
             label = key[len(prefix_name) :].lower()
-            accounts[label] = _build_client(value, label)
+            accounts[label] = _build_client(_resolve_session_path(value), label)
 
     # Backward-compatible unsuffixed variables. A pool (TELEGRAM_SESSION_STRINGS)
     # takes precedence for the default account and claims a free session slot.
@@ -703,7 +758,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_string:
             accounts["default"] = _build_client(StringSession(session_string), "default")
         elif session_name:
-            accounts["default"] = _build_client(session_name, "default")
+            accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
 
     if not accounts:
         print(
@@ -873,11 +928,11 @@ console_handler.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for
 # Create file handler with absolute path. Keep the legacy location next to
 # top-level main.py, even though runtime code now lives inside telegram_mcp/.
 package_dir = os.path.dirname(os.path.abspath(__file__))
-script_dir = os.path.dirname(package_dir)
+script_dir = PROJECT_ROOT
 log_file_path = os.path.join(script_dir, "mcp_errors.log")
 
 try:
-    file_handler = logging.FileHandler(log_file_path, mode="a")  # Append mode
+    file_handler = logging.FileHandler(log_file_path, mode="a", encoding="utf-8")  # Append mode
     file_handler.setLevel(logging.ERROR)
 
     # Create formatters
@@ -2502,13 +2557,34 @@ async def _resolve_writable_file_path(
     return candidate, None
 
 
+# Global variables to store CLI-parsed configuration for runner.py
+global _CLI_TRANSPORT, _CLI_HOST, _CLI_PORT
+_CLI_TRANSPORT = None
+_CLI_HOST = None
+_CLI_PORT = None
+
+
+def _parse_allowed_roots_env(value: Optional[str]) -> List[str]:
+    """Parse a delimiter-separated list of paths from an environment variable string.
+
+    Supports semicolon (;) and comma (,) across all platforms, as well as colon (:)
+    when not part of a Windows drive letter prefix (e.g. C:\\path).
+    """
+    if not value or not value.strip():
+        return []
+    raw = value.strip()
+    tokens = re.split(r"[;,]|(?<!\b[a-zA-Z]):", raw)
+    return [part.strip("\"' \t\r\n") for part in tokens if part.strip("\"' \t\r\n")]
+
+
 def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="telegram-mcp",
         add_help=False,
         description=(
-            "Positional arguments and TELEGRAM_MCP_ALLOWED_ROOTS define "
-            "server-side roots for file-path tools."
+            "Positional arguments, TELEGRAM_MCP_ALLOWED_ROOTS and TELEGRAM_ALLOWED_ROOTS "
+            "define server-side roots for file-path tools. Also accepts --transport, "
+            "--host, and --port CLI flags."
         ),
     )
     parser.add_argument("allowed_roots", nargs="*")
@@ -2518,12 +2594,16 @@ def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
         choices=["stdio", "sse", "http"],
         default=os.getenv("MCP_TRANSPORT", "stdio").lower(),
     )
-    parser.add_argument("--port", type=int, default=int(os.getenv("MCP_PORT", "8765")))
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
     parsed, _unknown = parser.parse_known_args(argv or [])
 
-    env_roots = os.getenv("TELEGRAM_MCP_ALLOWED_ROOTS", "").split(",")
+    # Fork: TELEGRAM_MCP_ALLOWED_ROOTS (comma list); upstream: TELEGRAM_ALLOWED_ROOTS.
+    raw_roots: List[str] = list(parsed.allowed_roots)
+    raw_roots.extend(os.getenv("TELEGRAM_MCP_ALLOWED_ROOTS", "").split(","))
+    raw_roots.extend(_parse_allowed_roots_env(os.getenv("TELEGRAM_ALLOWED_ROOTS", "")))
     resolved_roots: List[Path] = []
-    for raw_root in [*parsed.allowed_roots, *env_roots]:
+    for raw_root in raw_roots:
         raw_root = raw_root.strip()
         if not raw_root:
             continue
@@ -2536,10 +2616,13 @@ def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
         resolved = root.resolve(strict=True)
         resolved_roots.append(resolved)
 
-    global SERVER_ALLOWED_ROOTS, _transport, _sse_port
+    global SERVER_ALLOWED_ROOTS, _transport, _sse_port, _CLI_TRANSPORT, _CLI_HOST, _CLI_PORT
     SERVER_ALLOWED_ROOTS = _dedupe_paths(resolved_roots)
     _transport = parsed.transport
-    _sse_port = parsed.port
+    _sse_port = parsed.port if parsed.port is not None else int(os.getenv("MCP_PORT", "8765"))
+    _CLI_TRANSPORT = parsed.transport
+    _CLI_HOST = parsed.host
+    _CLI_PORT = parsed.port
 
 
 # ---------------------------------------------------------------------------
