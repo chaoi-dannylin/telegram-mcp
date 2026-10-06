@@ -30,7 +30,7 @@ class FakeClient:
         self.requests.append(request)
         return SimpleNamespace()
 
-    async def upload_file(self, path):
+    async def upload_file(self, path, progress_callback=None):
         return SimpleNamespace(name=Path(path).name)
 
 

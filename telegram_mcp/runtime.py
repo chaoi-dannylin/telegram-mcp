@@ -6,6 +6,7 @@ import sys
 import json
 import time
 import asyncio
+import contextvars
 import sqlite3
 import logging
 import mimetypes
@@ -209,11 +210,13 @@ TOOL_TIMEOUT_SECONDS_DEFAULT = 55.0
 
 
 def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
-    """Return the server-side ceiling for one MCP tool call.
+    """Return the server-side ceiling for one MCP tool call, in seconds without progress.
 
     The default stays just above the two event-wait tools' 50-second defaults,
     while ensuring a wedged Telethon request becomes an explicit MCP error
-    before common client-side one-minute timeouts. Set the value to ``0`` or a
+    before common client-side one-minute timeouts. Calls that report progress
+    (file transfers, see ``note_tool_progress``) can run longer than that, so
+    they rely on the client allowing long requests. Set the value to ``0`` or a
     negative number only for a deliberately unbounded operator session.
     """
     raw_value = os.getenv("TELEGRAM_TOOL_TIMEOUT_SECONDS") if value is None else value
@@ -226,6 +229,167 @@ def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
+PROGRESS_NOTIFY_INTERVAL_SECONDS = 1.0
+
+
+class _ToolActivity:
+    """Progress state of the in-flight tool call."""
+
+    __slots__ = ("last", "sink", "last_sent", "last_progress", "pending")
+
+    def __init__(self, sink=None) -> None:
+        # When the call last showed progress (``time.monotonic``).
+        self.last = time.monotonic()
+        # (session, progress token, request id) when the client asked for progress.
+        self.sink = sink
+        self.last_sent = 0.0
+        # MCP requires progress to increase. A call can run several transfers in turn
+        # (transcription prefetch, multi-account fan-out), so a lower value is skipped.
+        self.last_progress = float("-inf")
+        # Strong references to in-flight notifications; the loop only keeps weak ones.
+        self.pending = set()
+
+
+# Set per tool call by ``_await_with_idle_timeout``. The tool runs in a task whose context
+# is copied from there, so it sees the same ``_ToolActivity`` and can push the deadline back.
+_tool_activity: contextvars.ContextVar[Optional[_ToolActivity]] = contextvars.ContextVar(
+    "_tool_activity", default=None
+)
+
+
+def _progress_sink():
+    """Where to send progress for the current request, or None if the client didn't ask."""
+    try:
+        request_context = mcp._mcp_server.request_context
+    except LookupError:
+        return None
+    meta = request_context.meta
+    progress_token = meta.progressToken if meta else None
+    if progress_token is None:
+        return None
+    return request_context.session, progress_token, request_context.request_id
+
+
+def _forget_progress_notification(activity: _ToolActivity):
+    def done(task: asyncio.Task) -> None:
+        activity.pending.discard(task)
+        # A lost progress notification (e.g. the client went away) must not fail the call.
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                pass
+
+    return done
+
+
+def _record_tool_progress(progress: Optional[float], total: Optional[float], message: str) -> None:
+    activity = _tool_activity.get()
+    if activity is None:
+        return
+    now = time.monotonic()
+    activity.last = now
+    if activity.sink is None or progress is None or progress <= activity.last_progress:
+        return
+    # Skipping while one is still in flight also stops tasks piling up behind a client
+    # that has stopped reading the stream.
+    if activity.pending or now - activity.last_sent < PROGRESS_NOTIFY_INTERVAL_SECONDS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    activity.last_sent = now
+    activity.last_progress = progress
+    session, progress_token, request_id = activity.sink
+    task = loop.create_task(
+        session.send_progress_notification(
+            progress_token=progress_token,
+            progress=float(progress),
+            total=float(total) if total else None,
+            message=message,
+            related_request_id=request_id,
+        )
+    )
+    activity.pending.add(task)
+    task.add_done_callback(_forget_progress_notification(activity))
+
+
+def note_tool_progress(transferred: Optional[int] = None, total: Optional[int] = None) -> None:
+    """Telethon ``progress_callback`` for one file: the current tool call is still moving.
+
+    The tool-call ceiling is an idle limit, not a total-duration limit. A large upload
+    legitimately takes minutes; only a call that has stopped making progress is wedged.
+    A total-duration limit cancels such uploads midway, so Telegram never receives the file.
+    When the client asked for progress, the bytes are also forwarded as an MCP progress
+    notification (at most once per ``PROGRESS_NOTIFY_INTERVAL_SECONDS``).
+    Outside a tool call (tests, scripts) this is a no-op.
+    """
+    mb = 1024 * 1024
+    if transferred is None:
+        message = ""
+    elif total:
+        message = f"{transferred / mb:.1f} / {total / mb:.1f} MB"
+    else:
+        message = f"{transferred / mb:.1f} MB"
+    _record_tool_progress(transferred, total, message)
+
+
+def note_album_progress(files_done: float, file_count: int) -> None:
+    """``note_tool_progress`` for albums.
+
+    Telethon reports an album as (files done + fraction of the current one, file count)
+    instead of bytes, so the message counts files.
+    """
+    current = min(int(files_done) + 1, file_count)
+    _record_tool_progress(files_done, file_count, f"file {current} of {file_count}")
+
+
+async def _await_with_idle_timeout(coro, timeout: Optional[float], sink=None):
+    """``asyncio.wait_for`` whose deadline restarts on every ``note_tool_progress``.
+
+    Raises ``asyncio.TimeoutError`` once ``timeout`` seconds pass without progress. A tool
+    that never reports progress therefore times out exactly like ``wait_for`` would.
+    ``timeout=None`` waits without a deadline but still forwards progress to ``sink``.
+    """
+    activity = _ToolActivity(sink)
+    token = _tool_activity.set(activity)
+    try:
+        task = asyncio.ensure_future(coro)
+    finally:
+        _tool_activity.reset(token)
+    try:
+        while True:
+            if timeout is None:
+                remaining = None
+            else:
+                remaining = activity.last + timeout - time.monotonic()
+                if remaining <= 0:
+                    break
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if done:
+                # Progress notifications must not arrive after the result.
+                if activity.pending:
+                    await asyncio.wait(set(activity.pending))
+                return task.result()
+    except BaseException:
+        # Our own caller was cancelled (client disconnect / MCP cancel): don't orphan the tool.
+        task.cancel()
+        raise
+    task.cancel()
+    # asyncio.wait rather than `await task`: a CancelledError from awaiting the task can't be
+    # told apart from our own caller being cancelled during this cleanup, which must propagate.
+    await asyncio.wait({task})
+    if not task.cancelled():
+        # Retrieve the outcome so asyncio doesn't log it as never retrieved; the call is
+        # reported as timed out either way.
+        try:
+            task.result()
+        except Exception:
+            pass
+    raise asyncio.TimeoutError
+
+
 def _install_annotation_hook() -> None:
     from mcp.types import CallToolRequest, ServerResult, CallToolResult
 
@@ -233,11 +397,12 @@ def _install_annotation_hook() -> None:
 
     async def annotated_handler(req):
         timeout = _tool_timeout_seconds()
+        call = _await_with_idle_timeout(original_handler(req), timeout, _progress_sink())
         if timeout is None:
-            response = await original_handler(req)
+            response = await call
         else:
             try:
-                response = await asyncio.wait_for(original_handler(req), timeout=timeout)
+                response = await call
             except asyncio.TimeoutError:
                 response = ServerResult(
                     CallToolResult(
@@ -246,7 +411,7 @@ def _install_annotation_hook() -> None:
                                 type="text",
                                 text=(
                                     "Telegram MCP tool timed out after "
-                                    f"{timeout:g}s (code: GEN-TIMEOUT). "
+                                    f"{timeout:g}s without progress (code: GEN-TIMEOUT). "
                                     "Completion is unknown; a write may already have "
                                     "succeeded. Check destination state before retrying "
                                     "non-idempotent operations."

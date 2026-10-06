@@ -67,9 +67,8 @@ async def set_profile_photo(
         )
         if path_error:
             return path_error
-        await cl(
-            functions.photos.UploadProfilePhotoRequest(file=await cl.upload_file(str(safe_path)))
-        )
+        uploaded = await cl.upload_file(str(safe_path), progress_callback=note_tool_progress)
+        await cl(functions.photos.UploadProfilePhotoRequest(file=uploaded))
         return f"Profile photo updated from {safe_path}."
     except Exception as e:
         return log_and_format_error("set_profile_photo", e, file_path=file_path)

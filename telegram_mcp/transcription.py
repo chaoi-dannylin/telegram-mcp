@@ -40,7 +40,12 @@ from typing import Optional
 import httpx
 from telethon.tl import functions
 
-from telegram_mcp.runtime import account_is_premium, get_marked_id, is_premium_rpc_error
+from telegram_mcp.runtime import (
+    account_is_premium,
+    get_marked_id,
+    is_premium_rpc_error,
+    note_tool_progress,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -467,7 +472,7 @@ async def _download_audio(cl, msg, limit: Optional[int], cfg=None):
     if limit is not None and isinstance(declared, int) and declared > limit:
         return None, _too_large(declared, limit, cfg)
     try:
-        data = await cl.download_media(msg, file=bytes)
+        data = await cl.download_media(msg, file=bytes, progress_callback=note_tool_progress)
     except Exception as e:
         return None, {"status": "error", "error": f"download failed: {e}"}
     if not data:

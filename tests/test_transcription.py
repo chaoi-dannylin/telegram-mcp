@@ -435,7 +435,7 @@ async def test_transcribe_via_groq_success(monkeypatch):
 
     msg = _voice_msg()
 
-    async def _download_media(m, file=None):
+    async def _download_media(m, file=None, progress_callback=None):
         assert m is msg
         assert file is bytes  # in-memory download, no disk path
         return b"raw-audio-bytes"
@@ -483,7 +483,7 @@ async def test_transcribe_via_groq_normalizes_audio_file_extension(
     )
     msg = _voice_msg(file=file_obj)
 
-    async def _download_media(m, file=None):
+    async def _download_media(m, file=None, progress_callback=None):
         return b"audio-bytes"
 
     client = SimpleNamespace(download_media=_download_media)
@@ -507,7 +507,7 @@ async def test_transcribe_via_groq_requires_api_key(monkeypatch):
 async def test_transcribe_via_groq_empty_download_is_error(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "k")
 
-    async def _download_media(m, file=None):
+    async def _download_media(m, file=None, progress_callback=None):
         return b""
 
     client = SimpleNamespace(download_media=_download_media)
@@ -524,7 +524,7 @@ async def test_transcribe_via_groq_empty_transcript_is_error(monkeypatch):
         transcription.httpx, "AsyncClient", lambda **kw: _FakeHttpxClient(response, [])
     )
 
-    async def _download_media(m, file=None):
+    async def _download_media(m, file=None, progress_callback=None):
         return b"raw-audio-bytes"
 
     client = SimpleNamespace(download_media=_download_media)
@@ -840,7 +840,7 @@ async def test_recording_within_the_limit_still_uploads(monkeypatch):
 
 
 def _bytes_client(payload=b"raw-audio-bytes"):
-    async def _download_media(m, file=None):
+    async def _download_media(m, file=None, progress_callback=None):
         assert file is bytes
         return payload
 

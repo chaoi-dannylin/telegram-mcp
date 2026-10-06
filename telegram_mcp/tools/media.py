@@ -276,7 +276,12 @@ async def send_file(
             return path_error
         entity = await resolve_entity(chat_id, cl)
         sent = await cl.send_file(
-            entity, str(safe_path), caption=caption, reply_to=topic_id, schedule=dt
+            entity,
+            str(safe_path),
+            caption=caption,
+            reply_to=topic_id,
+            schedule=dt,
+            progress_callback=note_tool_progress,
         )
         if dt:
             return f"File from {safe_path} scheduled for {dt.isoformat()} in chat {chat_id}."
@@ -324,7 +329,14 @@ async def _send_album(
         safe_paths.append(str(safe_path))
 
     entity = await resolve_entity(chat_id, cl)
-    sent = await cl.send_file(entity, safe_paths, caption=caption, reply_to=topic_id, schedule=dt)
+    sent = await cl.send_file(
+        entity,
+        safe_paths,
+        caption=caption,
+        reply_to=topic_id,
+        schedule=dt,
+        progress_callback=note_album_progress,
+    )
     if dt:
         return (
             f"Album of {len(safe_paths)} files scheduled for {dt.isoformat()} in chat {chat_id}."
@@ -435,6 +447,7 @@ async def download_media(
             def enforce_download_limit(received: int, total: int) -> None:
                 if received > limit or (total and total > limit):
                     raise _DownloadLimitExceeded
+                note_tool_progress(received, total)
 
             try:
                 downloaded = await cl.download_media(
@@ -526,7 +539,13 @@ async def send_voice(
             return "Voice file must be .ogg or .opus format."
 
         entity = await resolve_entity(chat_id, cl)
-        sent = await cl.send_file(entity, str(safe_path), voice_note=True, reply_to=topic_id)
+        sent = await cl.send_file(
+            entity,
+            str(safe_path),
+            voice_note=True,
+            reply_to=topic_id,
+            progress_callback=note_tool_progress,
+        )
         return f"Voice message sent to chat {chat_id} from {safe_path}.{sent_ids_suffix(sent)}"
     except Exception as e:
         return log_and_format_error(
@@ -556,7 +575,7 @@ async def upload_file(file_path: str, ctx: Optional[Context] = None, account: st
         if path_error:
             return path_error
 
-        uploaded = await cl.upload_file(str(safe_path))
+        uploaded = await cl.upload_file(str(safe_path), progress_callback=note_tool_progress)
         payload = {
             "path": str(safe_path),
             "name": getattr(uploaded, "name", safe_path.name),
@@ -645,7 +664,13 @@ async def send_sticker(
             return path_error
 
         entity = await resolve_entity(chat_id, cl)
-        sent = await cl.send_file(entity, str(safe_path), force_document=False, reply_to=topic_id)
+        sent = await cl.send_file(
+            entity,
+            str(safe_path),
+            force_document=False,
+            reply_to=topic_id,
+            progress_callback=note_tool_progress,
+        )
         return f"Sticker sent to chat {chat_id} from {safe_path}.{sent_ids_suffix(sent)}"
     except Exception as e:
         return log_and_format_error(
@@ -735,7 +760,9 @@ async def send_gif(
         if not isinstance(gif_id, int):
             return "gif_id must be a Telegram document ID (integer), not a file path. Use get_gif_search to find IDs."
         entity = await resolve_entity(chat_id, cl)
-        sent = await cl.send_file(entity, gif_id, reply_to=topic_id)
+        sent = await cl.send_file(
+            entity, gif_id, reply_to=topic_id, progress_callback=note_tool_progress
+        )
         return f"GIF sent to chat {chat_id}.{sent_ids_suffix(sent)}"
     except Exception as e:
         return log_and_format_error(

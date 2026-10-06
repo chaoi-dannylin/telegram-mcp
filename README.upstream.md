@@ -452,12 +452,20 @@ will use the server: a single long-lived process holds one Telegram
 connection, instead of every client spawning its own Telethon session —
 Telegram throttles and may flag accounts that open many parallel sessions.
 
-Every tool call also has a server-side ceiling of 55 seconds, configured with
-`TELEGRAM_TOOL_TIMEOUT_SECONDS`. A timed-out Telegram request returns an explicit
-MCP error instead of leaving the client waiting indefinitely. The error says
-that completion is unknown: a write may already have succeeded, so check the
-destination before retrying. Set the value to `0` only for a deliberately
-unbounded operator session.
+Every tool call also has a server-side ceiling of 55 seconds without progress,
+configured with `TELEGRAM_TOOL_TIMEOUT_SECONDS`. A timed-out Telegram request
+returns an explicit MCP error instead of leaving the client waiting
+indefinitely. The error says that completion is unknown: a write may already
+have succeeded, so check the destination before retrying. Set the value to `0`
+only for a deliberately unbounded operator session.
+
+File uploads and downloads restart that deadline on every transferred chunk, so
+a large file can take several minutes as long as it keeps moving. When the
+client sends a `progressToken`, the transfer is also reported as MCP progress
+notifications (at most once per second). The client must allow long calls: a
+client with its own fixed request timeout (often 60 seconds) that ignores
+progress can still cancel a long upload, or report a failure for a file that
+then arrives.
 
 Register the shared server with clients:
 

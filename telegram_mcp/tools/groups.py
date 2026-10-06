@@ -390,7 +390,7 @@ async def edit_chat_photo(
             return path_error
 
         entity = await resolve_entity(chat_id, cl)
-        uploaded_file = await cl.upload_file(str(safe_path))
+        uploaded_file = await cl.upload_file(str(safe_path), progress_callback=note_tool_progress)
 
         if isinstance(entity, Channel):
             # For channels/supergroups, use EditPhotoRequest with InputChatUploadedPhoto
