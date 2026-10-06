@@ -148,6 +148,105 @@ async def test_a_failed_progress_notification_does_not_fail_the_call():
     assert await runtime._await_with_idle_timeout(upload(), 5, (session, "tok", 7)) == "sent"
 
 
+class _StuckSession:
+    """A client that has stopped reading the stream: a notification never goes out."""
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.task = None
+
+    async def send_progress_notification(self, **kwargs):
+        self.task = asyncio.current_task()
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [5, None])
+async def test_a_stuck_progress_notification_does_not_hold_back_the_result(monkeypatch, timeout):
+    monkeypatch.setattr(runtime, "PROGRESS_FLUSH_TIMEOUT_SECONDS", 0.05)
+    session = _StuckSession()
+
+    async def upload():
+        runtime.note_tool_progress(1 * MB, 2 * MB)
+        return "sent"
+
+    # The outer wait_for only keeps a regression from hanging the suite.
+    call = runtime._await_with_idle_timeout(upload(), timeout, (session, "tok", 7))
+    assert await asyncio.wait_for(call, 2) == "sent"
+    assert session.task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_call_cancels_its_progress_notification():
+    session = _StuckSession()
+
+    async def upload():
+        runtime.note_tool_progress(1 * MB, 2 * MB)
+        await asyncio.Event().wait()
+
+    call = asyncio.ensure_future(
+        runtime._await_with_idle_timeout(upload(), 5, (session, "tok", 7))
+    )
+    await asyncio.wait_for(session.started.wait(), 2)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    await asyncio.wait({session.task}, timeout=1)
+    assert session.task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_timing_out_cancels_the_progress_notification():
+    session = _StuckSession()
+
+    async def upload():
+        runtime.note_tool_progress(1 * MB, 2 * MB)
+        await asyncio.Event().wait()
+
+    call = asyncio.ensure_future(
+        runtime._await_with_idle_timeout(upload(), 0.05, (session, "tok", 7))
+    )
+    # Not wait_for: its own TimeoutError would look the same as the idle timeout's.
+    done, _ = await asyncio.wait({call}, timeout=2)
+    assert call in done
+    with pytest.raises(asyncio.TimeoutError):
+        call.result()
+    assert session.task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_call_while_a_timed_out_tool_winds_down_cancels_the_notification():
+    session = _StuckSession()
+    winding_down = asyncio.Event()
+    tool = None
+
+    async def upload():
+        nonlocal tool
+        tool = asyncio.current_task()
+        runtime.note_tool_progress(1 * MB, 2 * MB)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            # Like a Telethon request finishing its round trip before it stops.
+            winding_down.set()
+            await asyncio.sleep(0.3)
+            raise
+
+    call = asyncio.ensure_future(
+        runtime._await_with_idle_timeout(upload(), 0.05, (session, "tok", 7))
+    )
+    await asyncio.wait_for(winding_down.wait(), 2)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    await asyncio.wait({session.task}, timeout=1)
+    assert session.task.cancelled()
+    await asyncio.wait({tool}, timeout=2)
+
+
 def _request_context(meta):
     return RequestContext(request_id=9, meta=meta, session=object(), lifespan_context=None)
 

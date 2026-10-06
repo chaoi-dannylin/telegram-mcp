@@ -230,6 +230,8 @@ def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
 
 
 PROGRESS_NOTIFY_INTERVAL_SECONDS = 1.0
+# How long a finished call waits for its last progress notification before cancelling it.
+PROGRESS_FLUSH_TIMEOUT_SECONDS = 1.0
 
 
 class _ToolActivity:
@@ -345,6 +347,29 @@ def note_album_progress(files_done: float, file_count: int) -> None:
     _record_tool_progress(files_done, file_count, f"file {current} of {file_count}")
 
 
+def _cancel_progress_notifications(activity: _ToolActivity) -> None:
+    for task in list(activity.pending):
+        task.cancel()
+
+
+async def _finish_progress_notifications(activity: _ToolActivity, grace: float) -> None:
+    """Give in-flight progress notifications ``grace`` seconds, then cancel the rest.
+
+    A notification sent after the call ends would reach the client after the result, so
+    every exit cancels what is left. The wait is bounded so an undeliverable notification
+    cannot keep a finished call from completing; whether the result itself gets through a
+    client that has stopped reading is then up to the transport.
+    """
+    pending = set(activity.pending)
+    if pending and grace > 0:
+        _, pending = await asyncio.wait(pending, timeout=grace)
+    if not pending:
+        return
+    _cancel_progress_notifications(activity)
+    # Bounded too, in case a notification swallows the cancellation.
+    await asyncio.wait(pending, timeout=PROGRESS_FLUSH_TIMEOUT_SECONDS)
+
+
 async def _await_with_idle_timeout(coro, timeout: Optional[float], sink=None):
     """``asyncio.wait_for`` whose deadline restarts on every ``note_tool_progress``.
 
@@ -369,17 +394,22 @@ async def _await_with_idle_timeout(coro, timeout: Optional[float], sink=None):
             done, _ = await asyncio.wait({task}, timeout=remaining)
             if done:
                 # Progress notifications must not arrive after the result.
-                if activity.pending:
-                    await asyncio.wait(set(activity.pending))
+                await _finish_progress_notifications(activity, PROGRESS_FLUSH_TIMEOUT_SECONDS)
                 return task.result()
     except BaseException:
-        # Our own caller was cancelled (client disconnect / MCP cancel): don't orphan the tool.
+        # Our own caller was cancelled (client disconnect / MCP cancel): don't orphan the tool
+        # or its progress notifications. Cancel only, without awaiting: we are being cancelled.
         task.cancel()
+        _cancel_progress_notifications(activity)
         raise
     task.cancel()
+    # Before the await below: if our caller is cancelled while the tool winds down, nothing
+    # after it runs.
+    _cancel_progress_notifications(activity)
     # asyncio.wait rather than `await task`: a CancelledError from awaiting the task can't be
     # told apart from our own caller being cancelled during this cleanup, which must propagate.
     await asyncio.wait({task})
+    await _finish_progress_notifications(activity, 0)
     if not task.cancelled():
         # Retrieve the outcome so asyncio doesn't log it as never retrieved; the call is
         # reported as timed out either way.
