@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# One-shot health check for the telegram-mcp server across all five layers:
+# One-shot health check for the telegram-mcp server across all seven layers
+# (the client layers 3-7 run in parallel):
 #   1. launchd  — is the background service loaded *and running*?
 #   2. server   — is the HTTP port listening? (401 is healthy: auth is enforced)
 #   3. claude   — is Claude's MCP registration actually connecting?
@@ -12,6 +13,13 @@
 #                 handshakes. Grok expands `${TELEGRAM_MCP_TOKEN}` in the registered
 #                 Authorization header, so this probe publishes that env var the same
 #                 way a Grok session started after `make use-http-grok` would.
+#   6. agy      — is AGY's MCP registration actually connecting? AGY stores
+#                 `${TELEGRAM_MCP_TOKEN}` in its config and expands it at runtime;
+#                 we probe the same way as Codex: resolve the token, then POST
+#                 `initialize` to confirm the handshake.
+#   7. copilot  — is Copilot's MCP registration enabled and does its token work?
+#                 Copilot also expands `${TELEGRAM_MCP_TOKEN}` at connect time and
+#                 has no probe, so it gets the same handshake as AGY.
 #
 # Read-only: never changes config. Exits 0 when every layer is healthy,
 # 1 otherwise, so it can gate other commands (`make health && ...`).
@@ -35,6 +43,8 @@ MCP_NAME="${MCP_NAME:-telegram-mcp}"
 CLAUDE="${CLAUDE:-claude}"
 CODEX="${CODEX:-codex}"
 GROK="${GROK:-grok}"
+AGY="${AGY:-agy}"
+COPILOT="${COPILOT:-copilot}"
 LAUNCHD_LABEL="com.telegram-mcp.server"
 LOG_ERR="$HOME/Library/Logs/telegram-mcp/server.err.log"
 
@@ -72,84 +82,145 @@ case "${code:-000}" in
   *)   bad "HTTP $code — up but unexpected status";;
 esac
 
-# 3. claude — registration status. A missing CLI is not a failure (Codex-only setups).
-echo "claude :"
-if ! command -v "$CLAUDE" >/dev/null 2>&1; then
-  skip "claude CLI not found"
-elif ! mcp_get="$("$CLAUDE" mcp get "$MCP_NAME" 2>/dev/null)" || [[ -z "$mcp_get" ]]; then
-  bad "$MCP_NAME not registered — run 'make use-http-claude'"
-elif grep -q 'Connected' <<<"$mcp_get"; then
-  ok "connected (Claude's own registration)"
-else
-  # `claude mcp get` reports the reason on an "Issue:" line; fall through to the raw
-  # status text if the format ever changes.
-  issue="$(sed -n 's/^[[:space:]]*Issue:[[:space:]]*//p' <<<"$mcp_get" | head -1)"
-  bad "NOT connected — ${issue:-$(grep -E 'Status' <<<"$mcp_get" | head -1 | sed 's/^[[:space:]]*//')}"
-fi
+# 3+. clients — each layer checks one client's own registration and connection.
+#     A missing CLI is skipped, not failed (single-client setups are normal).
 
-# 4. codex — config plus a real handshake. A missing CLI is not a failure (Claude-only
-#    setups). `codex mcp get` reports config only, so after the config checks we probe
-#    the connection the way Codex would: read the token out of the env var Codex is
-#    configured to use and POST an `initialize` request. The token is never echoed.
-echo "codex  :"
-if ! command -v "$CODEX" >/dev/null 2>&1; then
-  skip "codex CLI not found"
-elif ! codex_get="$("$CODEX" mcp get "$MCP_NAME" 2>/dev/null)" || [[ -z "$codex_get" ]]; then
-  bad "$MCP_NAME not registered — run 'make use-http-codex'"
-elif ! grep -qE '^[[:space:]]*enabled:[[:space:]]*true' <<<"$codex_get"; then
-  bad "registered but DISABLED — run 'make use-http-codex'"
-else
-  codex_transport="$(awk '/^[[:space:]]*transport:/{print $2; exit}' <<<"$codex_get")"
-  codex_var="$(awk '/^[[:space:]]*bearer_token_env_var:/{print $2; exit}' <<<"$codex_get")"
-  if [[ -z "$codex_var" || "$codex_var" == "-" ]]; then
-    bad "enabled ($codex_transport) but no bearer_token_env_var — run 'make use-http-codex'"
-  else
-    # Both lookups are paths Codex itself uses: launcher.sh publishes the token via
-    # `launchctl setenv` (what a GUI-launched Codex inherits), and a Codex started from
-    # a shell inherits that shell's exported value instead.
-    codex_token="$(resolve_token "$codex_var")"
-    if [[ -z "$codex_token" ]]; then
-      bad "enabled ($codex_transport) but \$$codex_var is unset — restart the service"
-    else
-      codex_code="$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST \
-        -H 'Content-Type: application/json' \
-        -H 'Accept: application/json, text/event-stream' \
-        -H "Authorization: Bearer $codex_token" \
-        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"health-check","version":"0"}}}' \
-        "$MCP_URL" 2>/dev/null)"
-      case "${codex_code:-000}" in
-        200) ok  "handshake OK ($codex_transport, token from \$$codex_var)";;
-        401) bad "the token in \$$codex_var was REJECTED (HTTP 401)";;
-        000) bad "server unreachable at $MCP_HOST:$MCP_PORT";;
-        *)   bad "handshake returned HTTP $codex_code";;
-      esac
-    fi
+# probe_token <env var> <ok detail> — POST `initialize` with the token a client
+# reads from <env var>, the way that client would, and report the verdict. For
+# clients whose CLI has no connection probe of its own (a dead URL still lists
+# as registered). The token is never echoed.
+probe_token() {
+  local var="$1" detail="$2" token code
+  token="$(resolve_token "$var")"
+  if [[ -z "$token" ]]; then
+    bad "registered but \$$var is unset — restart the service"
+    return
   fi
-fi
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -m 5 -X POST \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H "Authorization: Bearer $token" \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"health-check","version":"0"}}}' \
+    "$MCP_URL" 2>/dev/null)"
+  case "${code:-000}" in
+    200) ok  "handshake OK ($detail)";;
+    401) bad "the token in \$$var was REJECTED (HTTP 401)";;
+    000) bad "server unreachable at $MCP_HOST:$MCP_PORT";;
+    *)   bad "handshake returned HTTP $code";;
+  esac
+}
 
-# 5. grok — registration plus a real handshake via `grok mcp doctor`. A missing
-#    CLI is not a failure (Claude/Codex-only setups). Grok stores
-#    `Authorization: Bearer ${TELEGRAM_MCP_TOKEN}` and expands it at load time,
-#    so the token is never written to ~/.grok/config.toml. Publish the same
-#    lookup Codex uses (process env, then launchctl) before probing.
-echo "grok   :"
-if ! command -v "$GROK" >/dev/null 2>&1; then
-  skip "grok CLI not found"
-else
-  grok_token="$(resolve_token TELEGRAM_MCP_TOKEN)"
-  grok_out="$(TELEGRAM_MCP_TOKEN="$grok_token" "$GROK" mcp doctor "$MCP_NAME" --json 2>/dev/null)" || true
-  if [[ "$grok_out" == *"not found"* ]]; then
+# claude — `claude mcp get` connects for real, so its status line is the verdict.
+check_claude() {
+  local mcp_get issue
+  if ! mcp_get="$("$CLAUDE" mcp get "$MCP_NAME" 2>/dev/null)" || [[ -z "$mcp_get" ]]; then
+    bad "$MCP_NAME not registered — run 'make use-http-claude'"
+  elif grep -q 'Connected' <<<"$mcp_get"; then
+    ok "connected (Claude's own registration)"
+  else
+    # `claude mcp get` reports the reason on an "Issue:" line; fall through to the raw
+    # status text if the format ever changes.
+    issue="$(sed -n 's/^[[:space:]]*Issue:[[:space:]]*//p' <<<"$mcp_get" | head -1)"
+    bad "NOT connected — ${issue:-$(grep -E 'Status' <<<"$mcp_get" | head -1 | sed 's/^[[:space:]]*//')}"
+  fi
+}
+
+# codex — `codex mcp get` reports config only, so probe with the token from the
+# env var Codex is configured to read. Both lookups in resolve_token are paths
+# Codex itself uses: launcher.sh publishes the token via `launchctl setenv` (what
+# a GUI-launched Codex inherits); a shell-started Codex inherits the shell's value.
+check_codex() {
+  local codex_get transport var
+  if ! codex_get="$("$CODEX" mcp get "$MCP_NAME" 2>/dev/null)" || [[ -z "$codex_get" ]]; then
+    bad "$MCP_NAME not registered — run 'make use-http-codex'"
+    return
+  fi
+  if ! grep -qE '^[[:space:]]*enabled:[[:space:]]*true' <<<"$codex_get"; then
+    bad "registered but DISABLED — run 'make use-http-codex'"
+    return
+  fi
+  transport="$(awk '/^[[:space:]]*transport:/{print $2; exit}' <<<"$codex_get")"
+  var="$(awk '/^[[:space:]]*bearer_token_env_var:/{print $2; exit}' <<<"$codex_get")"
+  if [[ -z "$var" || "$var" == "-" ]]; then
+    bad "enabled ($transport) but no bearer_token_env_var — run 'make use-http-codex'"
+  else
+    probe_token "$var" "$transport, token from \$$var"
+  fi
+}
+
+# grok — `grok mcp doctor` handshakes itself. Grok expands `${TELEGRAM_MCP_TOKEN}`
+# in the registered header, so publish that var the way a Grok session started
+# after `make use-http-grok` would see it.
+check_grok() {
+  local grok_out
+  grok_out="$(TELEGRAM_MCP_TOKEN="$(resolve_token TELEGRAM_MCP_TOKEN)" \
+    "$GROK" mcp doctor "$MCP_NAME" --json 2>/dev/null)" || true
+  if [[ -z "$grok_out" || "$grok_out" == *"not found"* ]]; then
     bad "$MCP_NAME not registered — run 'make use-http-grok'"
   elif [[ "$grok_out" == *'"healthy": true'* ]]; then
     ok "connected (Grok's own registration)"
   elif [[ "$grok_out" == *"401"* ]]; then
     bad "NOT connected — HTTP 401. Run 'make use-http-grok' so Grok sends \$TELEGRAM_MCP_TOKEN"
-  elif [[ -z "$grok_out" ]]; then
-    bad "$MCP_NAME not registered — run 'make use-http-grok'"
   else
     bad "NOT connected — run 'make use-http-grok'"
   fi
-fi
+}
+
+# agy — stores `${TELEGRAM_MCP_TOKEN}` in mcp_config.json and expands it at
+# load time; its CLI has no probe, so handshake with that token ourselves.
+check_agy() {
+  if agy_config_is_encrypted; then
+    bad "AGY config is Git-crypt encrypted — run 'git -C \"\$HOME/.gemini\" crypt unlock', then 'make use-http-agy'"
+  elif ! "$AGY" mcp list 2>/dev/null | grep -qF "$MCP_NAME"; then
+    bad "$MCP_NAME not registered — run 'make use-http-agy'"
+  else
+    probe_token TELEGRAM_MCP_TOKEN "token from \$TELEGRAM_MCP_TOKEN"
+  fi
+}
+
+# copilot — same model as AGY: `${TELEGRAM_MCP_TOKEN}` stays literal in
+# ~/.copilot/mcp-config.json and is expanded on connect; `copilot mcp get` has
+# no probe, so handshake with that token ourselves.
+check_copilot() {
+  local copilot_get
+  if ! copilot_get="$("$COPILOT" mcp get "$MCP_NAME" 2>/dev/null)"; then
+    bad "$MCP_NAME not registered — run 'make use-http-copilot'"
+  elif grep -qE '^[[:space:]]*Status:[[:space:]]*Disabled' <<<"$copilot_get"; then
+    bad "registered but DISABLED — run 'copilot mcp enable $MCP_NAME'"
+  else
+    probe_token TELEGRAM_MCP_TOKEN "token from \$TELEGRAM_MCP_TOKEN"
+  fi
+}
+
+# The client layers are independent read-only probes, so run them all at once
+# and print each block in MCP_CLIENTS order. Each runs in a subshell with its
+# own `fail`, reported back through the exit status.
+_tmp="$(mktemp -d)"
+_pids=()
+for _client in "${MCP_CLIENTS[@]}"; do
+  (
+    fail=0
+    _upper="$(tr '[:lower:]' '[:upper:]' <<<"$_client")"
+    _bin="${!_upper:-$_client}"
+    printf '%-7s:\n' "$_client"
+    if ! command -v "$_bin" >/dev/null 2>&1; then
+      skip "$_client CLI not found"
+    else
+      "check_$_client"
+    fi
+    exit "$fail"
+  ) >"$_tmp/$_client" 2>&1 </dev/null &
+  _pids+=("$!")
+done
+spinner_start "Checking MCP clients (${MCP_CLIENTS[*]})…"
+for _pid in "${_pids[@]}"; do
+  wait "$_pid" || fail=1
+done
+spinner_stop
+for _client in "${MCP_CLIENTS[@]}"; do
+  cat "$_tmp/$_client"
+done
+rm -rf "$_tmp"
 
 echo
 if [[ "$fail" -eq 0 ]]; then

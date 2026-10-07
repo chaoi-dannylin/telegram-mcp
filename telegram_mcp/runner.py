@@ -9,7 +9,15 @@ try:
 except UnsafeInstallationError as exc:
     raise SystemExit(str(exc)) from None
 
+import sys
 from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError
+
+# Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
 
 from telegram_mcp import runtime as _runtime
 from telegram_mcp import transcription as _transcription
@@ -207,11 +215,26 @@ async def _main() -> None:
 
         warm_task = asyncio.create_task(_warm_caches())
 
+        transport = _runtime._transport
+        VALID_TRANSPORTS = ("stdio", "http", "sse")
+        if transport not in VALID_TRANSPORTS:
+            accepted = ", ".join(VALID_TRANSPORTS)
+            print(
+                f"Invalid MCP_TRANSPORT '{transport}'. Expected one of: {accepted}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        where = ""
+        if transport in ("http", "sse"):
+            host = os.getenv("MCP_HOST", "127.0.0.1")
+            port = os.getenv("MCP_PORT", str(_runtime._sse_port))
+            where = f" on {host}:{port}"
         print(
-            f"Telegram client(s) started ({labels}). Running MCP server ({_runtime._transport})...",
+            f"Telegram client(s) started ({labels}). Running MCP server ({transport}){where}...",
             file=sys.stderr,
         )
-        await _serve(_runtime._transport)
+        await _serve(transport)
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
@@ -246,6 +269,17 @@ async def _main() -> None:
 
 def main() -> None:
     _configure_allowed_roots_from_cli(sys.argv[1:])
+    # Apply CLI transport/host/port overrides to environment (runtime sets globals)
+    transport = _runtime._CLI_TRANSPORT or "stdio"
+    host = _runtime._CLI_HOST
+    port = _runtime._CLI_PORT
+
+    if transport != "stdio":
+        os.environ["MCP_TRANSPORT"] = transport
+    if host:
+        os.environ["MCP_HOST"] = host
+    if port is not None:
+        os.environ["MCP_PORT"] = str(port)
     # Before _apply_exposed_tools_mode() / _apply_tool_disable_list(): those
     # prune tools from the manager, and the extension overrides validate tool
     # names against that same manager. Narrowing send_file's extensions while
@@ -255,7 +289,15 @@ def main() -> None:
     # exposure mode are complementary — apply both before serving.
     _runtime._apply_file_extension_overrides()
     _apply_tool_disable_list()
-    _runtime._apply_exposed_tools_mode()
+    hidden = _runtime._apply_exposed_tools_mode()
+    if hidden:
+        # These names are the menu for the "+" allowlist; without this line the
+        # only way to find them is reading the tool annotations in the source.
+        print(
+            f"TELEGRAM_EXPOSED_TOOLS hides {len(hidden)} tool(s); list any of them "
+            f"after '+' to expose it: {', '.join(sorted(hidden))}",
+            file=sys.stderr,
+        )
     _transcription.validate_transcription_config()
     _session_lock_shared()  # fail loudly at startup on a bad toggle
     asyncio.run(_main())

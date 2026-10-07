@@ -2,7 +2,7 @@
 
 每位成員需要用**自己的** Telegram 帳號完成以下步驟。Session 綁定個人帳號，不能共用。
 
-**推薦方式：Streamable HTTP 模式**。一個 server 在本機執行，Claude Code、Codex 與 Grok 透過 HTTP 共用同一條 session，避免多個 IDE 同時啟動時互相衝突。預設用 `bash scripts/setup.sh` 安裝並登記已安裝的 client，不需要在各專案中重複設定。
+**推薦方式：Streamable HTTP 模式**。一個 server 在本機執行，Claude Code、Codex、Grok、AGY 與 Copilot 透過 HTTP 共用同一條 session，避免多個 IDE 同時啟動時互相衝突。預設用 `bash scripts/setup.sh` 安裝並登記已安裝的 client，不需要在各專案中重複設定。
 
 > 若不想 clone 本專案，可改用[備用：stdio 模式](#備用stdio-模式)，但同一台機器上多個 IDE 同時使用時會有 session 衝突問題。
 
@@ -31,9 +31,9 @@ cd telegram-mcp
 
 <!-- -->
 
-> **預設安裝方式：** clone 完成後可直接執行 `make setup`（等同 `bash scripts/setup.sh`）。script 會安裝缺少的 uv、引導你完成 Telegram 憑證與 session string、建立專用檔案交換目錄 `~/Downloads/telegram_mcp_files`、安裝 launchd 常駐 Streamable HTTP server，並把 Claude Code、Codex 與 Grok MCP 設定指向 `http://127.0.0.1:8765/mcp`。
+> **預設安裝方式：** clone 完成後可直接執行 `make setup`（等同 `bash scripts/setup.sh`）。script 會安裝缺少的 uv、引導你完成 Telegram 憑證與 session string、建立專用檔案交換目錄 `~/Downloads/telegram_mcp_files`、安裝 launchd 常駐 Streamable HTTP server，並把 Claude Code、Codex、Grok、AGY 與 Copilot MCP 設定指向 `http://127.0.0.1:8765/mcp`。
 >
-> **常用指令：** 可執行 `make list` 查看所有 Makefile 指令。HTTP 模式用 `make start` 或 `make start-http` 前景啟動 server，再用 `make use-http` 將 Claude Code、Codex 與 Grok MCP 設定切到 `http://127.0.0.1:8765/mcp`。
+> **常用指令：** 可執行 `make list` 查看所有 Makefile 指令。HTTP 模式用 `make start` 或 `make start-http` 前景啟動 server，再用 `make use-http` 將 Claude Code、Codex、Grok、AGY 與 Copilot MCP 設定切到 `http://127.0.0.1:8765/mcp`。
 
 ---
 
@@ -93,7 +93,7 @@ uv run telegram-mcp-generate-session
 make setup
 ```
 
-這會自動完成 Keychain 寫入、建立 `~/Downloads/telegram_mcp_files` 作為專用 allowed root、安裝 launchd Streamable HTTP 常駐服務，以及 Claude Code／Codex／Grok MCP 設定。以下手動設定只在不使用 `make setup` 時需要。
+這會自動完成 Keychain 寫入、建立 `~/Downloads/telegram_mcp_files` 作為專用 allowed root、安裝 launchd Streamable HTTP 常駐服務，以及 Claude Code／Codex／Grok／AGY／Copilot MCP 設定。以下手動設定只在不使用 `make setup` 時需要。
 
 如果你已經把 Telegram 憑證存入 macOS Keychain，並且下列三個 item 都存在，HTTP / SSE / stdio 的 Makefile 啟動指令會自動讀取它們，不需要在 `.env` 填寫 Telegram 憑證：
 
@@ -221,18 +221,18 @@ Installer 設定會保存在 `~/Library/Application Support/telegram-mcp/allowed
 TELEGRAM_MCP_ALLOWED_ROOTS="" bash scripts/install-launchd.sh
 ```
 
-`TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1` 只會允許 fallback，不會建立或授權任何 root；單獨設定它無法啟用檔案工具。變更 roots 後請完全重啟 Claude Code／Codex／Grok，使 client 重新連線。
+`TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1` 只會允許 fallback，不會建立或授權任何 root；單獨設定它無法啟用檔案工具。變更 roots 後請完全重啟 Claude Code／Codex／Grok／AGY／Copilot，使 client 重新連線。
 
 ---
 
 ## 步驟五：切換 MCP client 設定
 
-若你是執行 `make setup` 或 `bash scripts/install-launchd.sh`，script 會分別偵測 Claude Code、Codex 與 Grok，並把已安裝的 client 設為 Streamable HTTP。未安裝的 client 會被跳過，並顯示安裝後應執行的註冊命令；此步驟可用 `make config-check` 確認。
+若你是執行 `make setup` 或 `bash scripts/install-launchd.sh`，script 會分別偵測 Claude Code、Codex、Grok、AGY 與 Copilot，並把已安裝的 client 設為 Streamable HTTP。未安裝的 client 會被跳過，並顯示安裝後應執行的註冊命令；此步驟可用 `make config-check` 確認。
 
 使用 Makefile 指令管理 MCP registration：
 
 ```bash
-# 檢查目前 Claude Code、Codex 與 Grok MCP 設定
+# 檢查目前 Claude Code、Codex、Grok、AGY 與 Copilot MCP 設定
 make config-check
 
 # 已安裝的 client 都切到 Streamable HTTP
@@ -251,9 +251,13 @@ make use-stdio
 claude mcp add-json --scope user telegram-mcp '{"type":"http","url":"http://127.0.0.1:8765/mcp","headersHelper":"/path/to/telegram-mcp/scripts/mcp-auth-headers.sh"}'
 codex mcp add telegram-mcp --url http://127.0.0.1:8765/mcp --bearer-token-env-var TELEGRAM_MCP_TOKEN
 grok mcp add --scope user --transport http telegram-mcp http://127.0.0.1:8765/mcp --header 'Authorization: Bearer ${TELEGRAM_MCP_TOKEN}'
+agy mcp add --type http --header 'Authorization: Bearer ${TELEGRAM_MCP_TOKEN}' telegram-mcp http://127.0.0.1:8765/mcp
+copilot mcp add --transport http --header 'Authorization: Bearer ${TELEGRAM_MCP_TOKEN}' telegram-mcp http://127.0.0.1:8765/mcp
 ```
 
-Claude Code 用 `headersHelper` 於連線時從 Keychain 讀取 bearer token；Codex 與 Grok 使用 `TELEGRAM_MCP_TOKEN`（Grok 把 `${TELEGRAM_MCP_TOKEN}` 寫進 header，連線時再展開）。安裝腳本會將該 Keychain token 設到使用者 launchd 環境，因此重新啟動後的 Codex／Grok 可取得它，不會把 token 寫進設定檔。
+`make use-http`／`make use-stdio`／`make config-check` 會平行處理所有 client，完成後依固定順序輸出；只想處理單一 client 時用 `make use-http-<client>`（`claude`、`codex`、`grok`、`agy`、`copilot`）。
+
+Claude Code 用 `headersHelper` 於連線時從 Keychain 讀取 bearer token；Codex、Grok、AGY 與 Copilot 使用 `TELEGRAM_MCP_TOKEN`（Grok、AGY 與 Copilot 把 `${TELEGRAM_MCP_TOKEN}` 字面寫進 header，連線時才展開）。安裝腳本會將該 Keychain token 設到使用者 launchd 環境，因此重新啟動後的 Codex／Grok／AGY／Copilot 可取得它，不會把 token 寫進設定檔。
 
 `make use-stdio` 會把已安裝 client 的 registration 改回由 client 啟動本專案：
 
@@ -261,11 +265,13 @@ Claude Code 用 `headersHelper` 於連線時從 Keychain 讀取 bearer token；C
 claude mcp add --scope user telegram-mcp -- "/path/to/telegram-mcp/scripts/start.sh" --transport stdio
 codex mcp add telegram-mcp -- "/path/to/telegram-mcp/scripts/start.sh" --transport stdio
 grok mcp add --scope user telegram-mcp -- "/path/to/telegram-mcp/scripts/start.sh" --transport stdio
+agy mcp add telegram-mcp -- "/path/to/telegram-mcp/scripts/start.sh" --transport stdio
+copilot mcp add telegram-mcp -- "/path/to/telegram-mcp/scripts/start.sh" --transport stdio
 ```
 
-`make use-sse` 只會把 Claude Code 設為 legacy SSE，並使用 `scripts/mcp-auth-headers.sh` 從 Keychain 讀取 bearer token。現有 Codex CLI 原生只支援 Streamable HTTP URL 與 stdio，不能直接設定 SSE；切換 SSE 時 Codex 與 Grok 設定保持不變。
+`make use-sse` 只會把 Claude Code 設為 legacy SSE，並使用 `scripts/mcp-auth-headers.sh` 從 Keychain 讀取 bearer token。現有 Codex CLI 原生只支援 Streamable HTTP URL 與 stdio，不能直接設定 SSE；切換 SSE 時 Codex、Grok、AGY 與 Copilot 設定保持不變。
 
-完全結束 Claude Code／Codex／Grok（**所有視窗**）後重新開啟即生效。
+完全結束 Claude Code／Codex／Grok／AGY／Copilot（**所有視窗**）後重新開啟即生效。
 
 ---
 
@@ -279,11 +285,11 @@ make start-http    # 前景啟動 Streamable HTTP mode
 make start-sse     # 前景啟動 legacy SSE mode
 make start-stdio   # 前景啟動 stdio mode
 
-make health        # 一次檢查 launchd／HTTP server／Claude／Codex／Grok 五層狀態
+make health        # 一次檢查 launchd／HTTP server／Claude／Codex／Grok／AGY／Copilot 七層狀態（client 層平行檢查）
 
-make config-check  # 顯示目前 Claude Code、Codex 與 Grok MCP 設定
-make use-http      # 已安裝的 client 切到 Streamable HTTP
-make use-sse       # Claude Code 切到 legacy SSE；Codex 與 Grok 維持原設定
+make config-check  # 顯示目前 Claude Code、Codex、Grok、AGY 與 Copilot MCP 設定
+make use-http      # 已安裝的 client 平行切到 Streamable HTTP
+make use-sse       # Claude Code 切到 legacy SSE；其他 client 維持原設定
 make use-stdio     # 已安裝的 client 切回 stdio
 ```
 
@@ -349,13 +355,13 @@ TELEGRAM_MCP_ALLOWED_ROOTS="~/Downloads/telegram_mcp_files,/absolute/path/to/pro
 
 ### 預設停用的危險工具
 
-以下 **19 個工具**預設停用（對 MCP 客戶端不可見），涵蓋不可逆刪除、權限變更、大量個人資料寫入等高風險操作：
+以下 **21 個工具**預設停用（對 MCP 客戶端不可見），涵蓋不可逆刪除、權限變更、大量個人資料寫入等高風險操作：
 
 | 類別 | 工具 |
 | ---- | ---- |
 | 刪除訊息 | `delete_message`、`delete_messages_bulk`、`delete_scheduled_message`、`delete_chat_history` |
-| 刪除資料 | `delete_folder`、`delete_contact`、`delete_profile_photo`、`delete_chat_photo` |
-| 群組管理 | `ban_user`、`promote_admin`、`demote_admin`、`edit_admin_rights` |
+| 刪除資料 | `delete_folder`、`delete_contact`、`delete_profile_photo`、`delete_chat_photo`、`delete_forum_topic` |
+| 群組管理 | `ban_user`、`remove_user`、`promote_admin`、`demote_admin`、`edit_admin_rights` |
 | 建立群組 | `create_group`、`create_channel` |
 | 資料匯出入 | `export_contacts`、`export_chat_invite`、`import_contacts` |
 | 帳號設定 | `set_privacy_settings`、`leave_chat` |
@@ -482,13 +488,15 @@ claude mcp list
 make health
 ```
 
-會一次列出五層狀態，每層以 ✅／❌ 標示（不適用的層級標 ⏭️）：
+會一次列出七層狀態（第 3–7 層的 client 檢查平行執行），每層以 ✅／❌ 標示（未安裝的 client 標 ⏭️）：
 
 1. **launchd** — 服務是否真的在執行（含 PID）。
 2. **server** — HTTP server 是否在監聽（`HTTP 401` 代表 server 正常且 bearer token 驗證有生效）。
 3. **claude** — Claude 的 MCP registration 是否連線成功（`claude mcp get` 會真的建立連線）。
 4. **codex** — Codex CLI 只會回報靜態設定（指向失效的 URL 也照樣顯示 `enabled`），因此這裡改為自行探測：取出 Codex 設定要讀的環境變數（`bearer_token_env_var`）中的 token，對 server 發出真正的 MCP `initialize` 請求。`200` 表示 Codex 這把 token 可以通過認證，`401` 表示 Codex 會被拒絕。token 不會出現在輸出中。
 5. **grok** — Grok 的 MCP registration 是否連線成功（`grok mcp doctor` 會真的建立連線）。Grok 展開 header 裡的 `${TELEGRAM_MCP_TOKEN}`，因此探測前會從環境變數或 launchd 補上同一把 token。
+6. **agy** — AGY 的 MCP registration 是否存在；AGY CLI 沒有連線探測，因此與 codex 相同，用 `TELEGRAM_MCP_TOKEN` 自行發出 `initialize`。
+7. **copilot** — GitHub Copilot CLI 的 registration 是否存在且未停用（`copilot mcp get`）；Copilot 同樣在連線時才展開 `${TELEGRAM_MCP_TOKEN}`，探測方式與 agy 相同。
 
 此指令純唯讀、不會改動任何設定；全部正常時 exit code 為 0，可串接其他指令（`make health && ...`）。
 

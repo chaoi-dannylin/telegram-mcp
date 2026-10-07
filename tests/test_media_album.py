@@ -11,7 +11,15 @@ class _DummyClient:
         self.sent = None
         self.schedule = None
 
-    async def send_file(self, entity, file_paths, caption=None, reply_to=None, schedule=None):
+    async def send_file(
+        self,
+        entity,
+        file_paths,
+        caption=None,
+        reply_to=None,
+        schedule=None,
+        progress_callback=None,
+    ):
         self.sent = {
             "entity": entity,
             "file_paths": file_paths,
@@ -19,6 +27,7 @@ class _DummyClient:
             "reply_to": reply_to,
         }
         self.schedule = schedule
+        self.progress_callback = progress_callback
 
 
 @pytest.mark.asyncio
@@ -59,6 +68,8 @@ async def test_album_mode_sends_multiple_files_as_one_media_group(
         "caption": "pick one",
         "reply_to": None,
     }
+    # Large uploads outlive the tool-call ceiling unless they report progress.
+    assert client.progress_callback is runtime.note_album_progress
 
 
 @pytest.mark.asyncio

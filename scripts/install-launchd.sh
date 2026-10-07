@@ -14,6 +14,7 @@ UV_BIN="$(command -v uv)"
 
 # MCP_HOST / MCP_PORT / MCP_URL from env, then .env, then defaults.
 source "$SCRIPT_DIR/mcp-endpoint.sh"
+source "$SCRIPT_DIR/spinner.sh"
 
 # Allowed roots for file-path tools (send_file, download_media, ...).
 #
@@ -154,7 +155,7 @@ if [[ -z "$TOKEN" ]]; then
   echo "[telegram-mcp] Generated and stored HTTP bearer token in Keychain"
 fi
 
-# Codex and Grok Streamable HTTP configuration reads the bearer token from the
+# Codex, Grok, AGY and Copilot Streamable HTTP configuration reads the bearer token from the
 # process environment. Publish the Keychain-backed value to the GUI launchd
 # domain so instances started after this installer inherit it; the token is
 # never written to client configuration.
@@ -166,23 +167,28 @@ launchctl unload "$PLIST_PATH" 2>/dev/null || true
 # The outgoing server keeps the port bound for a moment after unload. Wait for
 # it to be released first, otherwise the readiness probe below is satisfied by
 # the process we just stopped and we register clients against a dying server.
+spinner_start "[telegram-mcp] Stopping the previous server (port $MCP_PORT)…"
 for i in {1..20}; do
   nc -z "$MCP_HOST" "$MCP_PORT" 2>/dev/null || break
   sleep 0.5
 done
+spinner_stop
 
 launchctl load "$PLIST_PATH"
 
 # The Python server needs a few seconds to bind. Wait for it before registering
 # clients, otherwise Claude's registration probe (and any immediate `make health`)
 # sees a closed port and reports a failure that resolves itself moments later.
+PORT_UP=0
+spinner_start "[telegram-mcp] Starting the server on port $MCP_PORT (up to 20s)…"
 for i in {1..40}; do
-  nc -z "$MCP_HOST" "$MCP_PORT" 2>/dev/null && break
+  nc -z "$MCP_HOST" "$MCP_PORT" 2>/dev/null && { PORT_UP=1; break; }
   sleep 0.5
-  [[ $i -eq 40 ]] && echo "[telegram-mcp] WARNING: port $MCP_PORT still not listening after 20s — check $LOG_DIR/server.err.log" >&2
 done
+spinner_stop
+[[ "$PORT_UP" == 1 ]] || echo "[telegram-mcp] WARNING: port $MCP_PORT still not listening after 20s — check $LOG_DIR/server.err.log" >&2
 
-make -C "$PROJECT_DIR" use-http
+make -C "$PROJECT_DIR" --no-print-directory use-http
 
 echo "[telegram-mcp] LaunchAgent installed and Streamable HTTP server started on $MCP_URL"
 if [[ ${#ALLOWED_ROOTS[@]} -gt 0 ]]; then

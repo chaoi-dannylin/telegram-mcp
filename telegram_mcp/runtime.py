@@ -6,10 +6,18 @@ import sys
 import json
 import time
 import asyncio
+import contextvars
 import sqlite3
 import logging
 import mimetypes
 import unicodedata
+
+# Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        pass
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
@@ -19,8 +27,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 # Third-party libraries
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from mcp.server.fastmcp import FastMCP, Context, Image
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from mcp.types import Annotations, ImageContent, TextContent, ToolAnnotations
 from mcp.shared.exceptions import McpError
 from pythonjsonlogger import jsonlogger
@@ -46,7 +56,6 @@ from telethon.tl.types import (
     DialogFilterDefault,
     TextWithEntities,
 )
-import re
 import hashlib
 import tempfile
 
@@ -201,11 +210,13 @@ TOOL_TIMEOUT_SECONDS_DEFAULT = 55.0
 
 
 def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
-    """Return the server-side ceiling for one MCP tool call.
+    """Return the server-side ceiling for one MCP tool call, in seconds without progress.
 
     The default stays just above the two event-wait tools' 50-second defaults,
     while ensuring a wedged Telethon request becomes an explicit MCP error
-    before common client-side one-minute timeouts. Set the value to ``0`` or a
+    before common client-side one-minute timeouts. Calls that report progress
+    (file transfers, see ``note_tool_progress``) can run longer than that, so
+    they rely on the client allowing long requests. Set the value to ``0`` or a
     negative number only for a deliberately unbounded operator session.
     """
     raw_value = os.getenv("TELEGRAM_TOOL_TIMEOUT_SECONDS") if value is None else value
@@ -218,6 +229,197 @@ def _tool_timeout_seconds(value: Optional[str] = None) -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
+PROGRESS_NOTIFY_INTERVAL_SECONDS = 1.0
+# How long a finished call waits for its last progress notification before cancelling it.
+PROGRESS_FLUSH_TIMEOUT_SECONDS = 1.0
+
+
+class _ToolActivity:
+    """Progress state of the in-flight tool call."""
+
+    __slots__ = ("last", "sink", "last_sent", "last_progress", "pending")
+
+    def __init__(self, sink=None) -> None:
+        # When the call last showed progress (``time.monotonic``).
+        self.last = time.monotonic()
+        # (session, progress token, request id) when the client asked for progress.
+        self.sink = sink
+        self.last_sent = 0.0
+        # MCP requires progress to increase. A call can run several transfers in turn
+        # (transcription prefetch, multi-account fan-out), so a lower value is skipped.
+        self.last_progress = float("-inf")
+        # Strong references to in-flight notifications; the loop only keeps weak ones.
+        self.pending = set()
+
+
+# Set per tool call by ``_await_with_idle_timeout``. The tool runs in a task whose context
+# is copied from there, so it sees the same ``_ToolActivity`` and can push the deadline back.
+_tool_activity: contextvars.ContextVar[Optional[_ToolActivity]] = contextvars.ContextVar(
+    "_tool_activity", default=None
+)
+
+
+def _progress_sink():
+    """Where to send progress for the current request, or None if the client didn't ask."""
+    try:
+        request_context = mcp._mcp_server.request_context
+    except LookupError:
+        return None
+    meta = request_context.meta
+    progress_token = meta.progressToken if meta else None
+    if progress_token is None:
+        return None
+    return request_context.session, progress_token, request_context.request_id
+
+
+def _forget_progress_notification(activity: _ToolActivity):
+    def done(task: asyncio.Task) -> None:
+        activity.pending.discard(task)
+        # A lost progress notification (e.g. the client went away) must not fail the call.
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                pass
+
+    return done
+
+
+def _record_tool_progress(progress: Optional[float], total: Optional[float], message: str) -> None:
+    activity = _tool_activity.get()
+    if activity is None:
+        return
+    now = time.monotonic()
+    activity.last = now
+    if activity.sink is None or progress is None or progress <= activity.last_progress:
+        return
+    # Skipping while one is still in flight also stops tasks piling up behind a client
+    # that has stopped reading the stream.
+    if activity.pending or now - activity.last_sent < PROGRESS_NOTIFY_INTERVAL_SECONDS:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    activity.last_sent = now
+    activity.last_progress = progress
+    session, progress_token, request_id = activity.sink
+    task = loop.create_task(
+        session.send_progress_notification(
+            progress_token=progress_token,
+            progress=float(progress),
+            total=float(total) if total else None,
+            message=message,
+            related_request_id=request_id,
+        )
+    )
+    activity.pending.add(task)
+    task.add_done_callback(_forget_progress_notification(activity))
+
+
+def note_tool_progress(transferred: Optional[int] = None, total: Optional[int] = None) -> None:
+    """Telethon ``progress_callback`` for one file: the current tool call is still moving.
+
+    The tool-call ceiling is an idle limit, not a total-duration limit. A large upload
+    legitimately takes minutes; only a call that has stopped making progress is wedged.
+    A total-duration limit cancels such uploads midway, so Telegram never receives the file.
+    When the client asked for progress, the bytes are also forwarded as an MCP progress
+    notification (at most once per ``PROGRESS_NOTIFY_INTERVAL_SECONDS``).
+    Outside a tool call (tests, scripts) this is a no-op.
+    """
+    mb = 1024 * 1024
+    if transferred is None:
+        message = ""
+    elif total:
+        message = f"{transferred / mb:.1f} / {total / mb:.1f} MB"
+    else:
+        message = f"{transferred / mb:.1f} MB"
+    _record_tool_progress(transferred, total, message)
+
+
+def note_album_progress(files_done: float, file_count: int) -> None:
+    """``note_tool_progress`` for albums.
+
+    Telethon reports an album as (files done + fraction of the current one, file count)
+    instead of bytes, so the message counts files.
+    """
+    current = min(int(files_done) + 1, file_count)
+    _record_tool_progress(files_done, file_count, f"file {current} of {file_count}")
+
+
+def _cancel_progress_notifications(activity: _ToolActivity) -> None:
+    for task in list(activity.pending):
+        task.cancel()
+
+
+async def _finish_progress_notifications(activity: _ToolActivity, grace: float) -> None:
+    """Give in-flight progress notifications ``grace`` seconds, then cancel the rest.
+
+    A notification sent after the call ends would reach the client after the result, so
+    every exit cancels what is left. The wait is bounded so an undeliverable notification
+    cannot keep a finished call from completing; whether the result itself gets through a
+    client that has stopped reading is then up to the transport.
+    """
+    pending = set(activity.pending)
+    if pending and grace > 0:
+        _, pending = await asyncio.wait(pending, timeout=grace)
+    if not pending:
+        return
+    _cancel_progress_notifications(activity)
+    # Bounded too, in case a notification swallows the cancellation.
+    await asyncio.wait(pending, timeout=PROGRESS_FLUSH_TIMEOUT_SECONDS)
+
+
+async def _await_with_idle_timeout(coro, timeout: Optional[float], sink=None):
+    """``asyncio.wait_for`` whose deadline restarts on every ``note_tool_progress``.
+
+    Raises ``asyncio.TimeoutError`` once ``timeout`` seconds pass without progress. A tool
+    that never reports progress therefore times out exactly like ``wait_for`` would.
+    ``timeout=None`` waits without a deadline but still forwards progress to ``sink``.
+    """
+    activity = _ToolActivity(sink)
+    token = _tool_activity.set(activity)
+    try:
+        task = asyncio.ensure_future(coro)
+    finally:
+        _tool_activity.reset(token)
+    try:
+        while True:
+            if timeout is None:
+                remaining = None
+            else:
+                remaining = activity.last + timeout - time.monotonic()
+                if remaining <= 0:
+                    break
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if done:
+                # Progress notifications must not arrive after the result.
+                await _finish_progress_notifications(activity, PROGRESS_FLUSH_TIMEOUT_SECONDS)
+                return task.result()
+    except BaseException:
+        # Our own caller was cancelled (client disconnect / MCP cancel): don't orphan the tool
+        # or its progress notifications. Cancel only, without awaiting: we are being cancelled.
+        task.cancel()
+        _cancel_progress_notifications(activity)
+        raise
+    task.cancel()
+    # Before the await below: if our caller is cancelled while the tool winds down, nothing
+    # after it runs.
+    _cancel_progress_notifications(activity)
+    # asyncio.wait rather than `await task`: a CancelledError from awaiting the task can't be
+    # told apart from our own caller being cancelled during this cleanup, which must propagate.
+    await asyncio.wait({task})
+    await _finish_progress_notifications(activity, 0)
+    if not task.cancelled():
+        # Retrieve the outcome so asyncio doesn't log it as never retrieved; the call is
+        # reported as timed out either way.
+        try:
+            task.result()
+        except Exception:
+            pass
+    raise asyncio.TimeoutError
+
+
 def _install_annotation_hook() -> None:
     from mcp.types import CallToolRequest, ServerResult, CallToolResult
 
@@ -225,11 +427,12 @@ def _install_annotation_hook() -> None:
 
     async def annotated_handler(req):
         timeout = _tool_timeout_seconds()
+        call = _await_with_idle_timeout(original_handler(req), timeout, _progress_sink())
         if timeout is None:
-            response = await original_handler(req)
+            response = await call
         else:
             try:
-                response = await asyncio.wait_for(original_handler(req), timeout=timeout)
+                response = await call
             except asyncio.TimeoutError:
                 response = ServerResult(
                     CallToolResult(
@@ -238,7 +441,10 @@ def _install_annotation_hook() -> None:
                                 type="text",
                                 text=(
                                     "Telegram MCP tool timed out after "
-                                    f"{timeout:g}s (code: GEN-TIMEOUT)."
+                                    f"{timeout:g}s without progress (code: GEN-TIMEOUT). "
+                                    "Completion is unknown; a write may already have "
+                                    "succeeded. Check destination state before retrying "
+                                    "non-idempotent operations."
                                 ),
                             )
                         ],
@@ -571,8 +777,52 @@ def _get_flood_sleep_threshold() -> int:
         return 60
 
 
+def _resolve_session_path(session_name: str) -> str:
+    """Resolve a relative session name against the project root.
+
+    When TELEGRAM_SESSION_NAME is a relative path/name (e.g. 'my_session' or
+    'sessions/main'), running from a different working directory makes Telethon
+    search os.getcwd() and fail to find the existing .session file, triggering
+    an interactive login prompt.
+    This resolves the relative path against the repository/project root (or the
+    directory where .env was found) if the file exists there, or if running
+    from a subdirectory of the project root.
+    """
+    if not session_name or os.path.isabs(session_name) or session_name == ":memory:":
+        return session_name
+
+    candidate_roots = [PROJECT_ROOT]
+    try:
+        env_file = find_dotenv()
+        if env_file:
+            env_dir = os.path.dirname(os.path.abspath(env_file))
+            if env_dir not in candidate_roots:
+                candidate_roots.append(env_dir)
+    except Exception:
+        pass
+
+    for root in candidate_roots:
+        target = os.path.join(root, session_name)
+        target_session = target if target.endswith(".session") else f"{target}.session"
+        if os.path.exists(target) or os.path.exists(target_session):
+            return target
+
+    # If running from a subdirectory of project root, resolve to project root
+    # so subdirectories don't lose the session file
+    cwd = os.path.abspath(os.getcwd())
+    try:
+        if os.path.commonpath([cwd, PROJECT_ROOT]) == PROJECT_ROOT and cwd != PROJECT_ROOT:
+            return os.path.join(PROJECT_ROOT, session_name)
+    except ValueError:
+        pass
+
+    return session_name
+
+
 def _build_client(session: Any, label: str) -> TelegramClient:
     """Construct a ``TelegramClient`` honoring per-label proxy and flood sleep configuration."""
+    if isinstance(session, str):
+        session = _resolve_session_path(session)
     proxy, connection = _build_proxy_for_label(label)
     kwargs: dict[str, Any] = {}
     if proxy is not None:
@@ -687,7 +937,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
             accounts[label] = _build_client(StringSession(value), label)
         elif key.startswith(prefix_name) and value:
             label = key[len(prefix_name) :].lower()
-            accounts[label] = _build_client(value, label)
+            accounts[label] = _build_client(_resolve_session_path(value), label)
 
     # Backward-compatible unsuffixed variables. A pool (TELEGRAM_SESSION_STRINGS)
     # takes precedence for the default account and claims a free session slot.
@@ -703,7 +953,7 @@ def _discover_accounts() -> dict[str, TelegramClient]:
         elif session_string:
             accounts["default"] = _build_client(StringSession(session_string), "default")
         elif session_name:
-            accounts["default"] = _build_client(session_name, "default")
+            accounts["default"] = _build_client(_resolve_session_path(session_name), "default")
 
     if not accounts:
         print(
@@ -873,11 +1123,11 @@ console_handler.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for
 # Create file handler with absolute path. Keep the legacy location next to
 # top-level main.py, even though runtime code now lives inside telegram_mcp/.
 package_dir = os.path.dirname(os.path.abspath(__file__))
-script_dir = os.path.dirname(package_dir)
+script_dir = PROJECT_ROOT
 log_file_path = os.path.join(script_dir, "mcp_errors.log")
 
 try:
-    file_handler = logging.FileHandler(log_file_path, mode="a")  # Append mode
+    file_handler = logging.FileHandler(log_file_path, mode="a", encoding="utf-8")  # Append mode
     file_handler.setLevel(logging.ERROR)
 
     # Create formatters
@@ -912,6 +1162,7 @@ _DEFAULT_EXTENSION_ALLOWLISTS: dict[str, set[str]] = {
     "send_sticker": {".webp"},
     "set_profile_photo": {".jpg", ".jpeg", ".png", ".webp"},
     "edit_chat_photo": {".jpg", ".jpeg", ".png", ".webp"},
+    "export_unread_messages": {".json"},
 }
 # Mutable, TELEGRAM_FILE_EXTENSIONS-aware allowlist actually consulted by
 # _ensure_extension_allowed(). Rebuilt from _DEFAULT_EXTENSION_ALLOWLISTS by
@@ -2502,13 +2753,34 @@ async def _resolve_writable_file_path(
     return candidate, None
 
 
+# Global variables to store CLI-parsed configuration for runner.py
+global _CLI_TRANSPORT, _CLI_HOST, _CLI_PORT
+_CLI_TRANSPORT = None
+_CLI_HOST = None
+_CLI_PORT = None
+
+
+def _parse_allowed_roots_env(value: Optional[str]) -> List[str]:
+    """Parse a delimiter-separated list of paths from an environment variable string.
+
+    Supports semicolon (;) and comma (,) across all platforms, as well as colon (:)
+    when not part of a Windows drive letter prefix (e.g. C:\\path).
+    """
+    if not value or not value.strip():
+        return []
+    raw = value.strip()
+    tokens = re.split(r"[;,]|(?<!\b[a-zA-Z]):", raw)
+    return [part.strip("\"' \t\r\n") for part in tokens if part.strip("\"' \t\r\n")]
+
+
 def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
         prog="telegram-mcp",
         add_help=False,
         description=(
-            "Positional arguments and TELEGRAM_MCP_ALLOWED_ROOTS define "
-            "server-side roots for file-path tools."
+            "Positional arguments, TELEGRAM_MCP_ALLOWED_ROOTS and TELEGRAM_ALLOWED_ROOTS "
+            "define server-side roots for file-path tools. Also accepts --transport, "
+            "--host, and --port CLI flags."
         ),
     )
     parser.add_argument("allowed_roots", nargs="*")
@@ -2518,12 +2790,16 @@ def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
         choices=["stdio", "sse", "http"],
         default=os.getenv("MCP_TRANSPORT", "stdio").lower(),
     )
-    parser.add_argument("--port", type=int, default=int(os.getenv("MCP_PORT", "8765")))
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
     parsed, _unknown = parser.parse_known_args(argv or [])
 
-    env_roots = os.getenv("TELEGRAM_MCP_ALLOWED_ROOTS", "").split(",")
+    # Fork: TELEGRAM_MCP_ALLOWED_ROOTS (comma list); upstream: TELEGRAM_ALLOWED_ROOTS.
+    raw_roots: List[str] = list(parsed.allowed_roots)
+    raw_roots.extend(os.getenv("TELEGRAM_MCP_ALLOWED_ROOTS", "").split(","))
+    raw_roots.extend(_parse_allowed_roots_env(os.getenv("TELEGRAM_ALLOWED_ROOTS", "")))
     resolved_roots: List[Path] = []
-    for raw_root in [*parsed.allowed_roots, *env_roots]:
+    for raw_root in raw_roots:
         raw_root = raw_root.strip()
         if not raw_root:
             continue
@@ -2536,10 +2812,13 @@ def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
         resolved = root.resolve(strict=True)
         resolved_roots.append(resolved)
 
-    global SERVER_ALLOWED_ROOTS, _transport, _sse_port
+    global SERVER_ALLOWED_ROOTS, _transport, _sse_port, _CLI_TRANSPORT, _CLI_HOST, _CLI_PORT
     SERVER_ALLOWED_ROOTS = _dedupe_paths(resolved_roots)
     _transport = parsed.transport
-    _sse_port = parsed.port
+    _sse_port = parsed.port if parsed.port is not None else int(os.getenv("MCP_PORT", "8765"))
+    _CLI_TRANSPORT = parsed.transport
+    _CLI_HOST = parsed.host
+    _CLI_PORT = parsed.port
 
 
 # ---------------------------------------------------------------------------
@@ -2557,6 +2836,7 @@ _DANGEROUS_TOOLS: frozenset[str] = frozenset(
         "delete_contact",
         "delete_profile_photo",
         "delete_chat_photo",
+        "delete_forum_topic",
         "ban_user",
         "remove_user",
         "promote_admin",

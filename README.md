@@ -66,7 +66,7 @@ make restart
 
 ### 🚀 一鍵安裝與常駐 HTTP 服務
 
-- `make setup`（= `bash scripts/setup.sh`）：一次安裝、將 bearer token 存入 Keychain、建立專用 allowed root `~/Downloads/telegram_mcp_files`，偵測內嵌 telegram-mcp 專案或 `TELEGRAM_MCP_SUMMARY_PROJECT` 後只額外授權其 `docs/chat/`，並把 Claude Code、Codex 與 Grok 設為連向同一個本機 HTTP server。
+- `make setup`（= `bash scripts/setup.sh`）：一次安裝、將 bearer token 存入 Keychain、建立專用 allowed root `~/Downloads/telegram_mcp_files`，偵測內嵌 telegram-mcp 專案或 `TELEGRAM_MCP_SUMMARY_PROJECT` 後只額外授權其 `docs/chat/`，並把 Claude Code、Codex、Grok、AGY 與 Copilot 設為連向同一個本機 HTTP server。
 - `scripts/install-launchd.sh`：安裝 launchd 服務並開機自啟，讓 HTTP server 常駐。
 - launchd 用的 stateless streamable HTTP 傳輸無法向 client 發出 Roots 請求，因此檔案工具只能使用啟動時明確授權的 server roots；沒有 roots 時，`download_media`、`send_file` 等工具會安全停用。`TELEGRAM_MCP_ALLOWED_ROOTS="~/Downloads/telegram_mcp_files,<project_root>/docs/chat"` 可放在 `.env`，請將 `<project_root>` 替換成該電腦的實際絕對路徑；它會與 installer／CLI roots 合併。`TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1` 本身不會建立 root。`telegram-summary` 解析圖片時優先使用不落地的 `open_photo`，需要保存附件時使用授權的專案 `docs/chat/`。詳見 [SETUP.md 的 allowed roots 說明](SETUP.md#檔案交換目錄allowed-roots)。
 
